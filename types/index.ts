@@ -33,7 +33,17 @@ export interface Exhibit {
   code: string
   title: string
   order: number
+  targetDurationMinutes: number
+  sourceVerified: boolean
+  sourceVerifiedAt: string
+  deliveredAt: string
+  deliveryFingerprint: string
   drafts: LanguageDraft[]
+}
+
+export interface DeliveryTodo {
+  languageId: string
+  text: string
 }
 
 export interface Language {

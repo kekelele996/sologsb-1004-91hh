@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
+import type { DeviceKind, DiffLine, Exhibit, LanguageDraft, ScriptStatus, Segment } from '~/types'
 import { LANGUAGES, useScriptStore } from '~/stores/script'
 
 const store = useScriptStore()
@@ -34,6 +34,15 @@ const filteredExhibits = computed(() => store.hallExhibits.filter(item => !leftF
 const versions = computed(() => store.versions.filter(item => item.exhibitId === store.selectedExhibitId && item.languageId === store.selectedLanguageId))
 const selectedVersionA = computed(() => versions.value.find(item => item.id === compareA.value))
 const selectedVersionB = computed(() => versions.value.find(item => item.id === compareB.value))
+const deliveryHalls = computed(() => store.halls.map(hall => ({
+  hall,
+  exhibits: store.exhibits.filter(item => item.hallId === hall.id).sort((a, b) => a.order - b.order)
+})))
+const deliverySummary = computed(() => ({
+  delivered: store.exhibits.filter(item => store.isDelivered(item)).length,
+  ready: store.exhibits.filter(item => !store.isDelivered(item) && store.isDeliverable(item)).length,
+  pending: store.exhibits.filter(item => !store.isDelivered(item) && !store.isDeliverable(item)).length
+}))
 const diffLines = computed<DiffLine[]>(() => {
   const before = selectedVersionA.value?.draft.narration || ''
   const after = selectedVersionB.value?.draft.narration || ''
@@ -106,6 +115,26 @@ function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 function segmentLabel(segment: Segment) { return segment.label || '未命名段落' }
+function draftOf(item: Exhibit, languageId: string) {
+  return item.drafts.find(draft => draft.languageId === languageId)
+}
+function lockedCount(languageDraft: LanguageDraft) {
+  return languageDraft.segments.filter(item => item.locked).length
+}
+function statusColor(status: ScriptStatus) {
+  return statusOptions.find(item => item.value === status)?.color || 'grey'
+}
+function deviationPercent(languageDraft: LanguageDraft, target: number) {
+  if (!target || !languageDraft.durationMinutes) return 0
+  return Math.round(Math.abs(languageDraft.durationMinutes - target) / target * 100)
+}
+function saveTargetDuration(exhibitId: string, event: Event) {
+  store.setTargetDuration(exhibitId, Number((event.target as HTMLInputElement).value))
+}
+function openInEditor(exhibitId: string) {
+  store.openExhibit(exhibitId)
+  activeTab.value = 'editor'
+}
 </script>
 
 <template>
@@ -153,7 +182,10 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
           >
             <template #prepend><v-chip size="small" variant="outlined">{{ item.code }}</v-chip></template>
             <v-list-item-title class="font-weight-medium">{{ item.title }}</v-list-item-title>
-            <v-list-item-subtitle>{{ item.drafts.length }} 种语言</v-list-item-subtitle>
+            <v-list-item-subtitle>
+              {{ item.drafts.length }} 种语言
+              <v-icon v-if="store.isDelivered(item)" icon="mdi-check-decagram" size="14" color="success" aria-label="已交付" />
+            </v-list-item-subtitle>
           </v-list-item>
         </v-list>
       </div>
@@ -198,9 +230,143 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
           <v-tab value="sources">资料核对</v-tab>
+          <v-tab value="delivery">交付清单</v-tab>
         </v-tabs>
 
-        <div v-if="draft">
+        <template v-if="activeTab === 'delivery'">
+          <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+            <div>
+              <div class="section-title">交付清单</div>
+              <div class="text-h6 font-weight-bold mt-1">开馆前按展厅与语言核对可交付稿件</div>
+            </div>
+            <div class="d-flex flex-wrap ga-2" aria-label="交付总览">
+              <v-chip color="success" variant="tonal">已交付 {{ deliverySummary.delivered }}</v-chip>
+              <v-chip color="primary" variant="tonal">可交付 {{ deliverySummary.ready }}</v-chip>
+              <v-chip color="warning" variant="tonal">待办 {{ deliverySummary.pending }}</v-chip>
+            </div>
+          </div>
+
+          <section v-for="group in deliveryHalls" :key="group.hall.id" class="mb-7" :aria-label="group.hall.name">
+            <div class="d-flex flex-wrap align-baseline ga-3 mb-3">
+              <h2 class="text-h6 font-weight-bold">{{ group.hall.name }}</h2>
+              <span class="text-caption text-medium-emphasis">{{ group.hall.description }}</span>
+            </div>
+            <v-alert v-if="!group.exhibits.length" type="info" variant="tonal" density="compact">该展厅暂无展项。</v-alert>
+
+            <v-card v-for="item in group.exhibits" :key="item.id" class="script-card pa-4 pa-md-5 mb-4">
+              <div class="d-flex flex-wrap align-center justify-space-between ga-3">
+                <div class="d-flex align-center ga-3">
+                  <v-chip size="small" variant="outlined">{{ item.code }}</v-chip>
+                  <div>
+                    <div class="font-weight-bold">{{ item.title }}</div>
+                    <div class="text-caption text-medium-emphasis">
+                      <template v-if="store.isDelivered(item)">已于 {{ formatTime(item.deliveredAt) }} 交付</template>
+                      <template v-else-if="store.isDeliverable(item)">全部语言定稿、段落确认且来源核验，可交付</template>
+                      <template v-else>待办 {{ store.todosFor(item).length }} 项</template>
+                    </div>
+                  </div>
+                </div>
+                <div class="d-flex align-center ga-2">
+                  <v-chip v-if="store.isDelivered(item)" color="success" variant="tonal" size="small">已交付</v-chip>
+                  <v-chip v-else-if="store.isDeliverable(item)" color="primary" variant="tonal" size="small">可交付</v-chip>
+                  <v-chip v-else color="warning" variant="tonal" size="small">待办中</v-chip>
+                  <v-btn size="small" variant="text" prepend-icon="mdi-open-in-new" @click="openInEditor(item.id)">打开编辑</v-btn>
+                </div>
+              </div>
+
+              <v-row class="mt-2" dense>
+                <v-col cols="12" md="4">
+                  <v-text-field
+                    :model-value="item.targetDurationMinutes || ''"
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    density="compact"
+                    hide-details
+                    label="目标朗读时长（分钟）"
+                    placeholder="未设定"
+                    @change="saveTargetDuration(item.id, $event)"
+                  />
+                </v-col>
+                <v-col cols="12" md="8" class="d-flex align-center">
+                  <v-switch
+                    :model-value="item.sourceVerified"
+                    color="success"
+                    density="compact"
+                    hide-details
+                    inset
+                    :label="item.sourceVerified ? `来源已核验${item.sourceVerifiedAt ? ` · 登记于 ${formatTime(item.sourceVerifiedAt)}` : ''}` : '来源未核验'"
+                    :aria-label="`登记展项 ${item.code} 的来源核验`"
+                    @update:model-value="store.setSourceVerified(item.id, Boolean($event))"
+                  />
+                </v-col>
+              </v-row>
+
+              <v-table density="compact" class="delivery-table mt-3">
+                <thead>
+                  <tr>
+                    <th>语言</th>
+                    <th>定稿状态</th>
+                    <th>段落确认</th>
+                    <th>预计时长</th>
+                    <th>与目标偏差</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="lang in LANGUAGES" :key="lang.id">
+                    <td class="font-weight-medium">{{ lang.label }}</td>
+                    <td>
+                      <v-chip v-if="draftOf(item, lang.id)" size="x-small" :color="statusColor(draftOf(item, lang.id)!.status)" variant="tonal">
+                        {{ store.statusLabel(draftOf(item, lang.id)!.status) }}
+                      </v-chip>
+                      <span v-else class="text-medium-emphasis">未创建</span>
+                    </td>
+                    <td>
+                      <template v-if="draftOf(item, lang.id)">{{ lockedCount(draftOf(item, lang.id)!) }}/{{ draftOf(item, lang.id)!.segments.length }} 已确认</template>
+                      <span v-else>—</span>
+                    </td>
+                    <td>
+                      <template v-if="draftOf(item, lang.id)">{{ draftOf(item, lang.id)!.durationMinutes }} 分钟</template>
+                      <span v-else>—</span>
+                    </td>
+                    <td>
+                      <v-chip
+                        v-if="draftOf(item, lang.id) && item.targetDurationMinutes"
+                        size="x-small"
+                        :color="deviationPercent(draftOf(item, lang.id)!, item.targetDurationMinutes) > 10 ? 'error' : 'success'"
+                        variant="tonal"
+                      >
+                        {{ deviationPercent(draftOf(item, lang.id)!, item.targetDurationMinutes) }}%
+                      </v-chip>
+                      <span v-else>—</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </v-table>
+
+              <div v-if="store.todosFor(item).length" class="mt-3">
+                <div class="section-title mb-1">待办</div>
+                <v-list density="compact" class="bg-transparent" :aria-label="`展项 ${item.code} 待办`">
+                  <v-list-item v-for="(todo, todoIndex) in store.todosFor(item)" :key="todoIndex" prepend-icon="mdi-alert-circle-outline" :title="todo.text" />
+                </v-list>
+              </div>
+              <v-alert v-else class="mt-3" type="success" variant="tonal" density="compact">
+                全部语言已定稿、段落全部确认且来源已核验，时长偏差在一成以内。
+              </v-alert>
+
+              <div class="d-flex flex-wrap justify-end ga-2 mt-3">
+                <v-btn v-if="store.isDelivered(item)" color="error" variant="outlined" size="small" prepend-icon="mdi-undo-variant" @click="store.revokeDelivery(item.id)">
+                  撤回交付
+                </v-btn>
+                <v-btn v-else color="primary" size="small" prepend-icon="mdi-check-decagram-outline" :disabled="!store.isDeliverable(item)" @click="store.deliverExhibit(item.id)">
+                  标记交付
+                </v-btn>
+              </div>
+            </v-card>
+          </section>
+        </template>
+
+        <div v-else-if="draft">
           <v-window v-model="activeTab" :touch="false">
             <v-window-item value="editor">
               <v-row>
@@ -229,7 +395,16 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                     <v-text-field label="展项标题" :model-value="draft.title" hint="面向观众的主标题" persistent-hint @change="saveDraftField('title', $event)" />
                     <v-row class="mt-2">
                       <v-col cols="12" md="5">
-                        <v-text-field label="预计朗读时长（分钟）" type="number" min="0" step="0.5" :model-value="draft.durationMinutes" @change="saveDraftField('durationMinutes', $event)" />
+                        <v-text-field
+                          label="预计朗读时长（分钟）"
+                          type="number"
+                          min="0"
+                          step="0.5"
+                          :model-value="draft.durationMinutes"
+                          :hint="exhibit?.targetDurationMinutes ? `目标 ${exhibit.targetDurationMinutes} 分钟，偏差超过一成将列入交付待办` : '尚未设定目标时长，请先在交付清单中设定'"
+                          persistent-hint
+                          @change="saveDraftField('durationMinutes', $event)"
+                        />
                       </v-col>
                       <v-col cols="12" md="7">
                         <v-text-field label="资料来源" :model-value="draft.sources" hint="书籍、档案号或专家核验记录" persistent-hint @change="saveDraftField('sources', $event)" />

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type { DeliveryTodo, Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -8,6 +8,29 @@ export const LANGUAGES: Language[] = [
 ]
 
 const STORAGE_KEY = 'museum-script-studio-v1'
+
+// 交付后用于检测改动的内容指纹：标题、讲解词、无障碍描述、预计时长与段落
+function contentFingerprint(exhibit: Exhibit): string {
+  return JSON.stringify(exhibit.drafts.map(draft => ({
+    languageId: draft.languageId,
+    title: draft.title,
+    narration: draft.narration,
+    accessibility: draft.accessibility,
+    durationMinutes: draft.durationMinutes,
+    segments: draft.segments.map(segment => [segment.label, segment.content, segment.locked])
+  })))
+}
+
+function normalizeExhibit(exhibit: Partial<Exhibit> & Pick<Exhibit, 'id' | 'hallId' | 'code' | 'title' | 'order' | 'drafts'>): Exhibit {
+  return {
+    targetDurationMinutes: 0,
+    sourceVerified: false,
+    sourceVerifiedAt: '',
+    deliveredAt: '',
+    deliveryFingerprint: '',
+    ...exhibit
+  }
+}
 
 const segments = (prefix: string, values: Array<[string, string, boolean?]>): Segment[] => values.map(([label, content, locked], index) => ({
   id: `${prefix}-${index + 1}`,
@@ -25,6 +48,8 @@ function demoState(): PersistedState {
   const exhibits: Exhibit[] = [
     {
       id: 'exhibit-jade', hallId: 'hall-ancient', code: 'A-03', title: '玉琮：沟通天地的礼器', order: 3,
+      targetDurationMinutes: 2.5, sourceVerified: true, sourceVerifiedAt: '2026-09-24T09:00:00.000Z',
+      deliveredAt: '', deliveryFingerprint: '',
       drafts: [
         {
           id: 'draft-jade-zh', languageId: 'zh', title: '玉琮：沟通天地的礼器',
@@ -67,6 +92,8 @@ function demoState(): PersistedState {
     },
     {
       id: 'exhibit-bronze', hallId: 'hall-ancient', code: 'A-08', title: '青铜爵与礼制', order: 8,
+      targetDurationMinutes: 2.5, sourceVerified: false, sourceVerifiedAt: '',
+      deliveredAt: '', deliveryFingerprint: '',
       drafts: [
         {
           id: 'draft-bronze-zh', languageId: 'zh', title: '青铜爵与礼制',
@@ -93,6 +120,8 @@ function demoState(): PersistedState {
     },
     {
       id: 'exhibit-silk', hallId: 'hall-silk', code: 'B-02', title: '织机与丝路纹样', order: 2,
+      targetDurationMinutes: 0, sourceVerified: false, sourceVerifiedAt: '',
+      deliveredAt: '', deliveryFingerprint: '',
       drafts: [{
         id: 'draft-silk-zh', languageId: 'zh', title: '织机与丝路纹样',
         narration: '织机把一根根丝线组织成布匹，也把不同地区的图案与故事连接在一起。',
@@ -154,6 +183,7 @@ export const useScriptStore = defineStore('museum-script', {
       if (saved) {
         try {
           const data = JSON.parse(saved) as PersistedState
+          data.exhibits = (data.exhibits || []).map(normalizeExhibit)
           this.$patch({ ...data, hydrated: true })
           if (!this.halls.length || !this.exhibits.length) this.resetDemo()
         } catch {
@@ -163,6 +193,7 @@ export const useScriptStore = defineStore('museum-script', {
         this.resetDemo()
       }
       this.ensureSelection()
+      this.syncDeliveries()
       this.hydrated = true
     },
     resetDemo() {
@@ -178,8 +209,22 @@ export const useScriptStore = defineStore('museum-script', {
       if (this.past.length > 50) this.past.shift()
       this.future = []
       mutator()
+      const revoked = this.syncDeliveries()
       this.lastSavedAt = new Date().toISOString()
       this.persist()
+      if (revoked.length) this.notice = `展项 ${revoked.join('、')} 在交付后发生改动，交付标记已撤回，请重新核对交付清单。`
+    },
+    // 交付后若标题、讲解词、无障碍描述、时长或段落有改动，撤回交付标记
+    syncDeliveries(): string[] {
+      const revoked: string[] = []
+      for (const exhibit of this.exhibits) {
+        if (exhibit.deliveredAt && exhibit.deliveryFingerprint !== contentFingerprint(exhibit)) {
+          exhibit.deliveredAt = ''
+          exhibit.deliveryFingerprint = ''
+          revoked.push(exhibit.code)
+        }
+      }
+      return revoked
     },
     persist() {
       if (typeof localStorage === 'undefined') return
@@ -216,8 +261,8 @@ export const useScriptStore = defineStore('museum-script', {
     updateDraft(patch: Partial<Pick<LanguageDraft, 'title' | 'narration' | 'accessibility' | 'durationMinutes' | 'sources'>>) {
       const draft = this.selectedDraft
       if (!draft) return
-      this.commit(() => Object.assign(draft, patch, { updatedAt: new Date().toISOString() }))
       this.notice = '改动已自动保存到浏览器。'
+      this.commit(() => Object.assign(draft, patch, { updatedAt: new Date().toISOString() }))
     },
     updateSegment(id: string, patch: Partial<Pick<Segment, 'label' | 'content'>>) {
       const segment = this.selectedDraft?.segments.find(item => item.id === id)
@@ -227,8 +272,8 @@ export const useScriptStore = defineStore('museum-script', {
     toggleLock(id: string) {
       const segment = this.selectedDraft?.segments.find(item => item.id === id)
       if (!segment) return
+      this.notice = segment.locked ? '段落已解锁。' : '段落已锁定，避免误改。'
       this.commit(() => { segment.locked = !segment.locked })
-      this.notice = segment.locked ? '段落已锁定，避免误改。' : '段落已解锁。'
     },
     addSegment() {
       const draft = this.selectedDraft
@@ -244,8 +289,8 @@ export const useScriptStore = defineStore('museum-script', {
     setStatus(status: ScriptStatus) {
       const draft = this.selectedDraft
       if (!draft) return
-      this.commit(() => { draft.status = status; draft.updatedAt = new Date().toISOString() })
       this.notice = `状态已更新为“${this.statusLabel(status)}”。`
+      this.commit(() => { draft.status = status; draft.updatedAt = new Date().toISOString() })
     },
     statusLabel(status: ScriptStatus) {
       return ({ draft: '草稿', review: '待审', returned: '退回', approved: '已定稿' })[status]
@@ -261,12 +306,13 @@ export const useScriptStore = defineStore('museum-script', {
         createdAt: new Date().toISOString(),
         draft: JSON.parse(JSON.stringify(draft))
       }
-      this.commit(() => this.versions.unshift(version))
       this.notice = '已保存当前版本，可在版本页比较或恢复。'
+      this.commit(() => this.versions.unshift(version))
     },
     restoreVersion(id: string) {
       const version = this.versions.find(item => item.id === id)
       if (!version) return
+      this.notice = '版本已恢复，并作为一次可撤销操作保存。'
       this.commit(() => {
         const exhibit = this.exhibits.find(item => item.id === version.exhibitId)
         if (!exhibit) return
@@ -277,33 +323,109 @@ export const useScriptStore = defineStore('museum-script', {
       })
       this.selectedExhibitId = version.exhibitId
       this.selectedLanguageId = version.languageId
-      this.notice = '版本已恢复，并作为一次可撤销操作保存。'
     },
     undo() {
       const state = this.past.pop()
       if (!state) return
       this.future.push(this.snapshot())
       this.$patch(JSON.parse(state))
+      const revoked = this.syncDeliveries()
       this.lastSavedAt = new Date().toISOString()
       this.ensureSelection()
       this.persist()
-      this.notice = '已撤销上一步。'
+      this.notice = revoked.length ? `展项 ${revoked.join('、')} 的交付标记已撤回，请重新核对交付清单。` : '已撤销上一步。'
     },
     redo() {
       const state = this.future.pop()
       if (!state) return
       this.past.push(this.snapshot())
       this.$patch(JSON.parse(state))
+      const revoked = this.syncDeliveries()
       this.lastSavedAt = new Date().toISOString()
       this.ensureSelection()
       this.persist()
-      this.notice = '已重做。'
+      this.notice = revoked.length ? `展项 ${revoked.join('、')} 的交付标记已撤回，请重新核对交付清单。` : '已重做。'
     },
     completionFor(exhibit: Exhibit, languageId: string): number {
       const draft = exhibit.drafts.find(item => item.languageId === languageId)
       if (!draft) return 0
       const checks = [draft.title, draft.narration, draft.accessibility, draft.sources, draft.segments.length > 0 ? 'segments' : '']
       return Math.round(checks.filter(Boolean).length / checks.length * 100)
+    },
+    openExhibit(exhibitId: string) {
+      const exhibit = this.exhibits.find(item => item.id === exhibitId)
+      if (!exhibit) return
+      this.selectedHallId = exhibit.hallId
+      this.selectedExhibitId = exhibit.id
+      this.ensureSelection()
+      this.persist()
+    },
+    // 交付待办：目标时长、来源核验、各语言定稿、段落确认与时长偏差（超过一成）
+    todosFor(exhibit: Exhibit): DeliveryTodo[] {
+      const todos: DeliveryTodo[] = []
+      const target = exhibit.targetDurationMinutes
+      if (!target) todos.push({ languageId: '', text: '尚未设定目标朗读时长' })
+      if (!exhibit.sourceVerified) todos.push({ languageId: '', text: '资料来源尚未核验登记' })
+      for (const lang of LANGUAGES) {
+        const draft = exhibit.drafts.find(item => item.languageId === lang.id)
+        if (!draft) {
+          todos.push({ languageId: lang.id, text: `${lang.label}稿件尚未创建` })
+          continue
+        }
+        if (draft.status !== 'approved') todos.push({ languageId: lang.id, text: `${lang.label}未定稿（当前为“${this.statusLabel(draft.status)}”）` })
+        if (!draft.segments.length) todos.push({ languageId: lang.id, text: `${lang.label}尚未划分段落` })
+        const unconfirmed = draft.segments.filter(item => !item.locked).length
+        if (unconfirmed) todos.push({ languageId: lang.id, text: `${lang.label}还有 ${unconfirmed} 个段落未确认` })
+        if (target && draft.durationMinutes) {
+          const deviation = Math.abs(draft.durationMinutes - target) / target
+          if (deviation > 0.1 + 1e-9) todos.push({ languageId: lang.id, text: `${lang.label}预计 ${draft.durationMinutes} 分钟，与目标 ${target} 分钟偏差 ${Math.round(deviation * 100)}%，超过一成` })
+        }
+      }
+      return todos
+    },
+    isDeliverable(exhibit: Exhibit): boolean {
+      return this.todosFor(exhibit).length === 0
+    },
+    isDelivered(exhibit: Exhibit): boolean {
+      return Boolean(exhibit.deliveredAt)
+    },
+    setTargetDuration(exhibitId: string, minutes: number) {
+      const exhibit = this.exhibits.find(item => item.id === exhibitId)
+      if (!exhibit) return
+      const value = Number.isFinite(minutes) ? Math.max(0, Math.round(minutes * 10) / 10) : 0
+      this.notice = value > 0 ? `展项 ${exhibit.code} 目标朗读时长已设为 ${value} 分钟。` : `展项 ${exhibit.code} 的目标朗读时长已清除，记得重新设定。`
+      this.commit(() => { exhibit.targetDurationMinutes = value })
+    },
+    setSourceVerified(exhibitId: string, verified: boolean) {
+      const exhibit = this.exhibits.find(item => item.id === exhibitId)
+      if (!exhibit) return
+      this.notice = verified ? `展项 ${exhibit.code} 来源已登记核验。` : `展项 ${exhibit.code} 的来源核验已取消。`
+      this.commit(() => {
+        exhibit.sourceVerified = verified
+        exhibit.sourceVerifiedAt = verified ? new Date().toISOString() : ''
+      })
+    },
+    deliverExhibit(exhibitId: string) {
+      const exhibit = this.exhibits.find(item => item.id === exhibitId)
+      if (!exhibit) return
+      if (!this.isDeliverable(exhibit)) {
+        this.notice = `展项 ${exhibit.code} 仍有待办未完成，全部语言定稿、段落确认且来源核验后才能交付。`
+        return
+      }
+      this.commit(() => {
+        exhibit.deliveredAt = new Date().toISOString()
+        exhibit.deliveryFingerprint = contentFingerprint(exhibit)
+      })
+      this.notice = `展项 ${exhibit.code} 已交付。交付后改动标题、讲解词、无障碍描述、时长或段落将自动撤回交付。`
+    },
+    revokeDelivery(exhibitId: string) {
+      const exhibit = this.exhibits.find(item => item.id === exhibitId)
+      if (!exhibit?.deliveredAt) return
+      this.notice = `展项 ${exhibit.code} 的交付标记已撤回。`
+      this.commit(() => {
+        exhibit.deliveredAt = ''
+        exhibit.deliveryFingerprint = ''
+      })
     }
   }
 })
