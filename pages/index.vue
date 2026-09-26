@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
-import { LANGUAGES, useScriptStore } from '~/stores/script'
+import type { DeliveryIssue, DeliveryRecord, DeviceKind, DiffLine, Exhibit, LanguageDraft, ScriptStatus, Segment } from '~/types'
+import { DURATION_TOLERANCE, LANGUAGES, deviationRatio, evaluateExhibit, formatDuration, useScriptStore } from '~/stores/script'
 
 const store = useScriptStore()
 const activeTab = ref('editor')
@@ -12,6 +12,8 @@ const compareA = ref('')
 const compareB = ref('')
 const helpDialog = ref(false)
 const deleteTarget = ref<string | null>(null)
+const withdrawTarget = ref<string | null>(null)
+const verifierNames = reactive<Record<string, string>>({})
 
 const statusOptions: Array<{ value: ScriptStatus; label: string; color: string }> = [
   { value: 'draft', label: '草稿', color: 'grey' },
@@ -39,6 +41,43 @@ const diffLines = computed<DiffLine[]>(() => {
   const after = selectedVersionB.value?.draft.narration || ''
   return buildDiff(before, after)
 })
+const currentDeviationPercent = computed(() => exhibit.value && draft.value ? deviationPercent(exhibit.value, draft.value.languageId) : null)
+const durationOffTarget = computed(() => currentDeviationPercent.value !== null && currentDeviationPercent.value > DURATION_TOLERANCE * 100)
+
+const checklistRows = computed(() => store.hallExhibits.map(item => {
+  const issues = evaluateExhibit(item)
+  const delivered = store.activeDelivery(item.id)
+  const latest = store.latestDelivery(item.id)
+  return {
+    exhibit: item,
+    issues,
+    delivered,
+    withdrawn: !delivered && latest?.withdrawnAt ? latest : null
+  }
+}))
+const hallSummary = computed(() => {
+  const perLanguage: Record<string, { deliverable: number; total: number }> = {}
+  for (const lang of LANGUAGES) perLanguage[lang.id] = { deliverable: 0, total: checklistRows.value.length }
+  let issueCount = 0
+  let durationIssues = 0
+  let sourceIssues = 0
+  let segmentIssues = 0
+  let deliverableExhibits = 0
+  let delivered = 0
+  for (const row of checklistRows.value) {
+    issueCount += row.issues.length
+    durationIssues += row.issues.filter(issue => issue.code === 'duration-mismatch').length
+    sourceIssues += row.issues.filter(issue => issue.code === 'missing-source' || issue.code === 'source-unverified').length
+    segmentIssues += row.issues.filter(issue => issue.code === 'no-segments' || issue.code === 'segments-unconfirmed').length
+    if (!row.issues.length) deliverableExhibits++
+    if (row.delivered) delivered++
+    for (const lang of LANGUAGES) {
+      if (isLanguageDeliverable(row.exhibit, lang.id)) perLanguage[lang.id].deliverable++
+    }
+  }
+  return { perLanguage, issueCount, durationIssues, sourceIssues, segmentIssues, deliverableExhibits, delivered }
+})
+const deliverableCount = computed(() => Object.values(hallSummary.value.perLanguage).reduce((sum, item) => sum + item.deliverable, 0))
 
 onMounted(() => {
   store.hydrate()
@@ -84,6 +123,62 @@ function confirmDelete() {
   if (deleteTarget.value) store.removeSegment(deleteTarget.value)
   deleteTarget.value = null
 }
+function confirmWithdraw() {
+  if (withdrawTarget.value) store.withdrawExhibit(withdrawTarget.value)
+  withdrawTarget.value = null
+}
+function isLanguageDeliverable(item: Exhibit, languageId: string): boolean {
+  if (!item.drafts.some(entry => entry.languageId === languageId)) return false
+  return !evaluateExhibit(item).some(issue => issue.languageId === languageId)
+}
+function deviationPercent(item: Exhibit, languageId: string): number | null {
+  const entry = item.drafts.find(draftItem => draftItem.languageId === languageId)
+  const target = item.targetDurationMinutes
+  if (!entry || !(target && target > 0) || !(entry.durationMinutes > 0)) return null
+  return Math.round(deviationRatio(target, entry.durationMinutes) * 100)
+}
+function deviationText(item: Exhibit, languageId: string): string {
+  const percent = deviationPercent(item, languageId)
+  if (percent === null) return '—'
+  return percent > DURATION_TOLERANCE * 100 ? `${percent}%（超一成）` : `${percent}%`
+}
+function saveTarget(exhibitId: string, event: Event) {
+  const raw = (event.target as HTMLInputElement).value
+  const value = Number(raw)
+  store.setTargetDuration(exhibitId, raw === '' || !Number.isFinite(value) || value <= 0 ? null : value)
+}
+function goToLanguage(item: Exhibit, languageId: string) {
+  store.selectExhibit(item.id)
+  store.selectLanguage(languageId)
+  activeTab.value = 'editor'
+}
+function goToIssue(item: Exhibit, issue: DeliveryIssue) {
+  if (issue.languageId) goToLanguage(item, issue.languageId)
+  else store.selectExhibit(item.id)
+}
+function changedSummary(record: DeliveryRecord): string {
+  const labels = Array.from(new Set((record.changedFields || []).map(field => field.label)))
+  if (!labels.length) return '内容'
+  return labels.slice(0, 6).join('、') + (labels.length > 6 ? '等' : '')
+}
+function statusColor(status?: ScriptStatus) {
+  return statusOptions.find(item => item.value === status)?.color || 'grey'
+}
+function verifierFor(exhibitId: string, languageId: string): string {
+  const key = `${exhibitId}:${languageId}`
+  if (!(key in verifierNames)) {
+    const entry = store.exhibits.find(item => item.id === exhibitId)?.drafts.find(item => item.languageId === languageId)
+    verifierNames[key] = entry?.sourceVerifiedBy || ''
+  }
+  return verifierNames[key]
+}
+function setVerifier(exhibitId: string, languageId: string, value: string) {
+  verifierNames[`${exhibitId}:${languageId}`] = value
+}
+function toggleSourceVerified(value: boolean | null) {
+  if (!exhibit.value || !draft.value) return
+  store.setSourceVerification(exhibit.value.id, draft.value.languageId, Boolean(value), verifierFor(exhibit.value.id, draft.value.languageId))
+}
 function buildDiff(before: string, after: string): DiffLine[] {
   const a = before.split(/(?<=[。！？.!?])\s*/).filter(Boolean)
   const b = after.split(/(?<=[。！？.!?])\s*/).filter(Boolean)
@@ -103,6 +198,7 @@ function buildDiff(before: string, after: string): DiffLine[] {
   return result
 }
 function formatTime(value: string) {
+  if (!value) return '—'
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 function segmentLabel(segment: Segment) { return segment.label || '未命名段落' }
@@ -153,7 +249,10 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
           >
             <template #prepend><v-chip size="small" variant="outlined">{{ item.code }}</v-chip></template>
             <v-list-item-title class="font-weight-medium">{{ item.title }}</v-list-item-title>
-            <v-list-item-subtitle>{{ item.drafts.length }} 种语言</v-list-item-subtitle>
+            <v-list-item-subtitle>
+              {{ item.drafts.length }} 种语言
+              <v-chip v-if="store.activeDelivery(item.id)" size="x-small" color="success" variant="tonal" class="ms-1">已交付</v-chip>
+            </v-list-item-subtitle>
           </v-list-item>
         </v-list>
       </div>
@@ -195,6 +294,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
 
         <v-tabs v-model="activeTab" color="primary" bg-color="surface" rounded="lg" class="mb-4 px-2">
           <v-tab value="editor">脚本编辑</v-tab>
+          <v-tab value="checklist">交付清单</v-tab>
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
           <v-tab value="sources">资料核对</v-tab>
@@ -230,6 +330,9 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                     <v-row class="mt-2">
                       <v-col cols="12" md="5">
                         <v-text-field label="预计朗读时长（分钟）" type="number" min="0" step="0.5" :model-value="draft.durationMinutes" @change="saveDraftField('durationMinutes', $event)" />
+                        <div class="text-caption mt-1" :class="durationOffTarget ? 'text-warning' : 'text-medium-emphasis'">
+                          目标 {{ exhibit?.targetDurationMinutes ? formatDuration(exhibit.targetDurationMinutes) : '未设定' }}<template v-if="currentDeviationPercent !== null"> · 偏差 {{ currentDeviationPercent }}%<template v-if="durationOffTarget">，超过一成，已列入交付待办</template></template>
+                        </div>
                       </v-col>
                       <v-col cols="12" md="7">
                         <v-text-field label="资料来源" :model-value="draft.sources" hint="书籍、档案号或专家核验记录" persistent-hint @change="saveDraftField('sources', $event)" />
@@ -289,13 +392,163 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                       <v-list-item :prepend-icon="draft.narration.length > 80 ? 'mdi-check-circle' : 'mdi-alert-circle'" :title="`讲解词 ${draft.narration.length} 字`" />
                       <v-list-item :prepend-icon="draft.accessibility.length > 30 ? 'mdi-check-circle' : 'mdi-alert-circle'" :title="`无障碍描述 ${draft.accessibility.length} 字`" />
                       <v-list-item :prepend-icon="draft.sources ? 'mdi-check-circle' : 'mdi-alert-circle'" :title="draft.sources ? '资料来源已填写' : '缺少资料来源'" />
+                      <v-list-item :prepend-icon="draft.sourceVerified ? 'mdi-check-circle' : 'mdi-alert-circle'" :title="draft.sourceVerified ? `来源已核验（${draft.sourceVerifiedBy || '未留名'}）` : '来源未核验登记'" />
+                      <v-list-item :prepend-icon="durationOffTarget ? 'mdi-alert-circle' : 'mdi-check-circle'" :title="currentDeviationPercent === null ? '目标时长未设定或预计时长无效' : `时长偏差 ${currentDeviationPercent}%${durationOffTarget ? '，超过一成' : ''}`" />
+                      <v-list-item :prepend-icon="draft.segments.length > 0 && draft.segments.every(item => item.locked) ? 'mdi-check-circle' : 'mdi-alert-circle'" :title="`段落 ${draft.segments.filter(item => item.locked).length}/${draft.segments.length} 已确认`" />
                     </v-list>
                     <v-alert class="mt-3" type="info" variant="tonal" density="compact">
                       估算语速约 {{ Math.max(1, Math.round(draft.narration.length / 220 * 10) / 10) }} 分钟，请与目标时长核对。
                     </v-alert>
+                    <v-btn class="mt-3" block variant="tonal" color="primary" prepend-icon="mdi-clipboard-check-outline" @click="activeTab = 'checklist'">查看交付清单</v-btn>
                   </v-card>
                 </v-col>
               </v-row>
+            </v-window-item>
+
+            <v-window-item value="checklist">
+              <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+                <div>
+                  <div class="section-title">交付清单</div>
+                  <div class="text-h6 font-weight-bold mt-1">按展厅与语言核对可交付稿件和待办</div>
+                </div>
+                <v-select
+                  :model-value="store.selectedHallId"
+                  :items="store.halls"
+                  item-title="name"
+                  item-value="id"
+                  label="展厅"
+                  hide-details
+                  style="min-width:220px"
+                  aria-label="选择交付清单展厅"
+                  @update:model-value="store.selectHall"
+                />
+              </div>
+
+              <v-row class="mb-2">
+                <v-col cols="12" md="4">
+                  <v-card class="script-card pa-5 h-100">
+                    <div class="section-title mb-2">可交付稿件</div>
+                    <div class="text-h4 font-weight-bold">
+                      {{ deliverableCount }} <span class="text-body-2 text-medium-emphasis">/ {{ checklistRows.length * LANGUAGES.length }} 个语言稿件</span>
+                    </div>
+                    <div class="text-body-2 text-medium-emphasis mt-2">{{ hallSummary.deliverableExhibits }} 个展项全部语言齐备，可整体交付</div>
+                    <div class="mt-3 d-flex flex-wrap ga-2">
+                      <v-chip v-for="lang in LANGUAGES" :key="lang.id" size="small" variant="tonal" :color="hallSummary.perLanguage[lang.id].deliverable === hallSummary.perLanguage[lang.id].total && hallSummary.perLanguage[lang.id].total > 0 ? 'success' : 'grey'">
+                        {{ lang.shortLabel }} {{ hallSummary.perLanguage[lang.id].deliverable }}/{{ hallSummary.perLanguage[lang.id].total }}
+                      </v-chip>
+                    </div>
+                  </v-card>
+                </v-col>
+                <v-col cols="12" md="4">
+                  <v-card class="script-card pa-5 h-100">
+                    <div class="section-title mb-2">待办</div>
+                    <div class="text-h4 font-weight-bold">{{ hallSummary.issueCount }} <span class="text-body-2 text-medium-emphasis">项</span></div>
+                    <div class="text-body-2 text-medium-emphasis mt-2">缺来源、段落未确认、时长偏差超过一成都会列入待办</div>
+                    <div class="mt-3 d-flex flex-wrap ga-2">
+                      <v-chip v-if="hallSummary.durationIssues" size="small" color="warning" variant="tonal">时长偏差 {{ hallSummary.durationIssues }}</v-chip>
+                      <v-chip v-if="hallSummary.sourceIssues" size="small" color="warning" variant="tonal">来源待办 {{ hallSummary.sourceIssues }}</v-chip>
+                      <v-chip v-if="hallSummary.segmentIssues" size="small" color="warning" variant="tonal">段落未确认 {{ hallSummary.segmentIssues }}</v-chip>
+                      <span v-if="!hallSummary.issueCount" class="text-body-2 text-success">当前展厅没有待办</span>
+                    </div>
+                  </v-card>
+                </v-col>
+                <v-col cols="12" md="4">
+                  <v-card class="script-card pa-5 h-100">
+                    <div class="section-title mb-2">已交付</div>
+                    <div class="text-h4 font-weight-bold">{{ hallSummary.delivered }} <span class="text-body-2 text-medium-emphasis">个展项</span></div>
+                    <div class="text-body-2 text-medium-emphasis mt-2">交付后改动标题、讲解词、无障碍描述、时长或段落，交付标记自动撤回并重新生成待办</div>
+                  </v-card>
+                </v-col>
+              </v-row>
+
+              <v-empty-state v-if="!checklistRows.length" icon="mdi-clipboard-list-outline" title="当前展厅暂无展项" text="请切换其他展厅查看交付清单。" />
+
+              <v-card v-for="row in checklistRows" :key="row.exhibit.id" class="script-card pa-4 pa-md-5 mb-4">
+                <div class="d-flex flex-wrap align-center justify-space-between ga-3">
+                  <div class="d-flex align-center ga-3 flex-wrap">
+                    <v-chip variant="outlined">{{ row.exhibit.code }}</v-chip>
+                    <div>
+                      <div class="text-h6 font-weight-bold">{{ row.exhibit.title }}</div>
+                      <div class="text-caption text-medium-emphasis">
+                        <template v-if="row.delivered">已于 {{ formatTime(row.delivered.deliveredAt) }} 交付</template>
+                        <template v-else-if="row.issues.length">{{ row.issues.length }} 项待办</template>
+                        <template v-else>全部语言就绪，可交付</template>
+                      </div>
+                    </div>
+                    <v-chip v-if="row.delivered" color="success" size="small" variant="tonal">已交付</v-chip>
+                    <v-chip v-else-if="!row.issues.length" color="primary" size="small" variant="tonal">可交付</v-chip>
+                    <v-chip v-else color="warning" size="small" variant="tonal">待办 {{ row.issues.length }}</v-chip>
+                  </div>
+                  <div class="d-flex align-center ga-2 flex-wrap">
+                    <v-btn v-if="row.delivered" variant="outlined" color="error" size="small" @click="withdrawTarget = row.exhibit.id">撤回交付</v-btn>
+                    <v-btn v-else color="primary" :disabled="row.issues.length > 0" @click="store.deliverExhibit(row.exhibit.id)">标记交付</v-btn>
+                  </div>
+                </div>
+
+                <v-alert v-if="row.withdrawn" class="mt-4" type="warning" variant="tonal" density="compact">
+                  交付标记已于 {{ formatTime(row.withdrawn.withdrawnAt || '') }} 撤回<template v-if="row.withdrawn.withdrawnReason === 'changed'">：检测到{{ changedSummary(row.withdrawn) }}改动</template><template v-else>（手动撤回）</template>。请重新处理待办后再交付。
+                </v-alert>
+
+                <div class="d-flex flex-wrap align-center ga-3 mt-4">
+                  <v-text-field
+                    :model-value="row.exhibit.targetDurationMinutes ?? ''"
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    density="compact"
+                    hide-details
+                    style="max-width:230px"
+                    label="目标朗读时长（分钟）"
+                    :aria-label="`${row.exhibit.title} 目标朗读时长`"
+                    @change="saveTarget(row.exhibit.id, $event)"
+                  />
+                  <span class="text-caption text-medium-emphasis">预计时长与目标偏差超过一成（10%）将列入待办</span>
+                </div>
+
+                <div class="mt-4 d-flex flex-column ga-3">
+                  <div v-for="lang in LANGUAGES" :key="lang.id" class="delivery-lang-row">
+                    <div class="d-flex flex-wrap align-center ga-3">
+                      <v-avatar size="30" :color="isLanguageDeliverable(row.exhibit, lang.id) ? 'success' : 'grey-lighten-2'" :class="isLanguageDeliverable(row.exhibit, lang.id) ? 'text-white' : ''">{{ lang.shortLabel }}</v-avatar>
+                      <div class="flex-grow-1" style="min-width:220px">
+                        <div class="d-flex align-center ga-2 flex-wrap">
+                          <span class="font-weight-medium">{{ lang.label }}</span>
+                          <v-chip size="x-small" :color="statusColor(row.exhibit.drafts.find(item => item.languageId === lang.id)?.status)" variant="tonal">
+                            {{ row.exhibit.drafts.find(item => item.languageId === lang.id) ? store.statusLabel(row.exhibit.drafts.find(item => item.languageId === lang.id)!.status) : '未创建' }}
+                          </v-chip>
+                          <v-chip v-if="isLanguageDeliverable(row.exhibit, lang.id)" size="x-small" color="success" variant="tonal">可交付</v-chip>
+                        </div>
+                        <div class="text-caption text-medium-emphasis mt-1">
+                          <template v-if="row.exhibit.drafts.find(item => item.languageId === lang.id)">
+                            预计 {{ formatDuration(row.exhibit.drafts.find(item => item.languageId === lang.id)!.durationMinutes) }} · 偏差 {{ deviationText(row.exhibit, lang.id) }} ·
+                            段落 {{ row.exhibit.drafts.find(item => item.languageId === lang.id)!.segments.filter(item => item.locked).length }}/{{ row.exhibit.drafts.find(item => item.languageId === lang.id)!.segments.length }} 已确认 ·
+                            来源 {{ row.exhibit.drafts.find(item => item.languageId === lang.id)!.sourceVerified ? `已核验（${row.exhibit.drafts.find(item => item.languageId === lang.id)!.sourceVerifiedBy || '未留名'}）` : (row.exhibit.drafts.find(item => item.languageId === lang.id)!.sources ? '未核验' : '缺失') }}
+                          </template>
+                          <template v-else>尚未建立该语言稿件</template>
+                        </div>
+                      </div>
+                      <v-btn size="small" variant="text" @click="goToLanguage(row.exhibit, lang.id)">打开</v-btn>
+                    </div>
+                  </div>
+                </div>
+
+                <template v-if="row.issues.length">
+                  <div class="section-title mt-5 mb-2">待办清单</div>
+                  <v-list density="compact" class="bg-transparent">
+                    <v-list-item
+                      v-for="(issue, issueIndex) in row.issues"
+                      :key="issueIndex"
+                      class="issue-item"
+                      rounded="lg"
+                      prepend-icon="mdi-alert-circle-outline"
+                      :title="issue.message"
+                      @click="goToIssue(row.exhibit, issue)"
+                    />
+                  </v-list>
+                </template>
+                <v-alert v-else class="mt-4" type="success" variant="tonal" density="compact">
+                  全部语言已定稿、段落已确认、来源已核验，预计时长偏差在一成以内。
+                </v-alert>
+              </v-card>
             </v-window-item>
 
             <v-window-item value="versions">
@@ -360,6 +613,26 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                 <v-col cols="12" md="7">
                   <v-card class="script-card pa-5">
                     <div class="section-title mb-3">来源与核验记录</div>
+                    <div class="d-flex flex-wrap align-center ga-3 mb-4">
+                      <v-checkbox
+                        :model-value="Boolean(draft.sourceVerified)"
+                        label="来源已核验"
+                        hide-details
+                        density="compact"
+                        :aria-label="`${currentLanguage?.label}来源核验标记`"
+                        @update:model-value="toggleSourceVerified"
+                      />
+                      <v-text-field
+                        :model-value="verifierFor(store.selectedExhibitId, store.selectedLanguageId)"
+                        label="核验人"
+                        density="compact"
+                        hide-details
+                        style="max-width:200px"
+                        @update:model-value="setVerifier(store.selectedExhibitId, store.selectedLanguageId, $event)"
+                      />
+                      <span v-if="draft.sourceVerifiedAt" class="text-caption text-medium-emphasis">登记于 {{ formatTime(draft.sourceVerifiedAt) }}</span>
+                    </div>
+                    <v-alert v-if="!draft.sourceVerified" class="mb-4" type="warning" variant="tonal" density="compact">来源尚未核验登记，展项交付前必须完成核验。</v-alert>
                     <v-textarea :model-value="draft.sources" rows="8" @change="saveDraftField('sources', $event)" />
                     <v-alert class="mt-4" type="warning" variant="tonal">发布前请由内容负责人逐条核对来源。当前无障碍描述与实物尺寸需由教育部门复核。</v-alert>
                   </v-card>
@@ -399,6 +672,14 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
         <v-card-title>删除这个段落？</v-card-title>
         <v-card-text>删除后可使用撤销恢复。</v-card-text>
         <v-card-actions><v-spacer /><v-btn @click="deleteTarget = null">取消</v-btn><v-btn color="error" @click="confirmDelete">删除</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog :model-value="Boolean(withdrawTarget)" max-width="440" @update:model-value="withdrawTarget = null">
+      <v-card class="pa-3">
+        <v-card-title>撤回交付标记？</v-card-title>
+        <v-card-text>撤回后展项回到待办状态，需重新满足全部语言定稿、段落确认、来源核验与时长要求后再交付。</v-card-text>
+        <v-card-actions><v-spacer /><v-btn @click="withdrawTarget = null">取消</v-btn><v-btn color="error" @click="confirmWithdraw">撤回交付</v-btn></v-card-actions>
       </v-card>
     </v-dialog>
 
